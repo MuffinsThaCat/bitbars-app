@@ -1,0 +1,11 @@
+{
+  "files": {
+    "main.css": "/bitbars-app/static/css/main.9fd54d97.css",
+    "main.js": "/bitbars-app/static/js/main.d324be72.js",
+    "index.html": "/bitbars-app/index.html"
+  },
+  "entrypoints": [
+    "static/css/main.9fd54d97.css",
+    "static/js/main.d324be72.js"
+  ]
+}

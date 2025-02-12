@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="200" height="200" version="1.1" viewBox="0 0 200 200" xmlns="http://www.w3.org/2000/svg">
+  <rect width="200" height="200" fill="#f7931a"/>
+  <g transform="translate(50,50)">
+    <path d="M50,0 A50,50 0 1,1 50,100 A50,50 0 1,1 50,0" fill="white"/>
+    <text x="35" y="65" font-family="Arial" font-size="24" fill="#f7931a">₿</text>
+  </g>
+</svg>
