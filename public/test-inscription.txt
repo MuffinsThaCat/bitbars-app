@@ -1,0 +1,7 @@
+This is a test file for Bitcoin inscription.
+It contains some sample text that we'll use to test the inscription process.
+The file size is well under 400KB, making it suitable for inscription on the Bitcoin network.
+
+Feel free to modify this content or replace it with your own data.
+
+Test completed: 2025-02-12

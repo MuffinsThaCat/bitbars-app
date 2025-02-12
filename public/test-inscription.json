@@ -1,0 +1,41 @@
+{
+  "name": "Bitcoin Inscription #1",
+  "description": "A test inscription for the BitBars application",
+  "version": "1.0.0",
+  "type": "image",
+  "mime": "image/png",
+  "attributes": [
+    {
+      "trait_type": "Category",
+      "value": "Test"
+    },
+    {
+      "trait_type": "Rarity",
+      "value": "Common"
+    },
+    {
+      "trait_type": "Size",
+      "value": "Small"
+    }
+  ],
+  "properties": {
+    "files": [
+      {
+        "uri": "test-image.png",
+        "type": "image/png"
+      }
+    ],
+    "category": "image",
+    "creators": [
+      {
+        "address": "BitBars Test Creator",
+        "share": 100
+      }
+    ]
+  },
+  "created_at": "2025-02-12T05:20:00-05:00",
+  "collection": {
+    "name": "BitBars Test Collection",
+    "family": "BitBars"
+  }
+}
