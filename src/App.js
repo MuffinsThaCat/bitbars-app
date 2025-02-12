@@ -23,6 +23,7 @@ function App() {
   const [selectedFile, setSelectedFile] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+  const [inscriptionStatus, setInscriptionStatus] = useState('');
 
   // Initialize bitcoinjs network
   const network = bitcoin.networks.bitcoin;
@@ -67,6 +68,36 @@ function App() {
     }
   };
 
+  const selectBestUtxo = async (requiredAmount, feeRate) => {
+    try {
+      const utxos = await window.unisat.getBitcoinUtxos();
+      if (!utxos || utxos.length === 0) {
+        throw new Error('No UTXOs available');
+      }
+
+      // Sort UTXOs by value, largest first
+      const sortedUtxos = utxos.sort((a, b) => 
+        (b.satoshis || b.value) - (a.satoshis || a.value)
+      );
+
+      // Find first UTXO that covers our required amount plus fees
+      const selectedUtxo = sortedUtxos.find(utxo => {
+        const value = utxo.satoshis || utxo.value || 0;
+        return value >= requiredAmount;
+      });
+
+      if (!selectedUtxo) {
+        const totalAvailable = utxos.reduce((sum, utxo) => sum + (utxo.satoshis || utxo.value || 0), 0);
+        throw new Error(`No suitable UTXO found. Need ${requiredAmount} sats, total available is ${totalAvailable} sats`);
+      }
+
+      return selectedUtxo;
+    } catch (error) {
+      console.error('Error selecting UTXO:', error);
+      throw error;
+    }
+  };
+
   const createInscriptionTransaction = async (fileData, feeRate) => {
     try {
       // Get address and check balance
@@ -75,60 +106,14 @@ function App() {
       console.log('Connected address:', address);
       console.log('Wallet balance:', balance);
 
-      if (balance.total < DUST_AMOUNT) {
-        throw new Error(`Insufficient balance. Have ${balance.total} sats, need at least ${DUST_AMOUNT} sats`);
-      }
-
-      // Get UTXOs from the wallet
-      const utxos = await window.unisat.getBitcoinUtxos();
-      console.log('Raw UTXOs:', utxos);
-      console.log('UTXO Structure:', {
-        firstUtxo: utxos[0],
-        utxoKeys: utxos[0] ? Object.keys(utxos[0]) : [],
-        txId: utxos[0]?.txId,
-        txid: utxos[0]?.txid,
-        outputIndex: utxos[0]?.outputIndex,
-        vout: utxos[0]?.vout,
-        satoshis: utxos[0]?.satoshis,
-        value: utxos[0]?.value
-      });
-
-      if (!utxos || utxos.length === 0) {
-        throw new Error('No UTXOs available');
-      }
-
-      // Calculate required amount and fees
-      const inscriptionSize = fileData.length + 546; // Add overhead for script
-      const MIN_FEE_RATE = 3; // Minimum fee rate in sats/vbyte
-      const currentFeeRate = await getFeeRate(); // Get current network fee rate
-      const effectiveFeeRate = Math.max(MIN_FEE_RATE, currentFeeRate); // Use at least MIN_FEE_RATE
-      
-      // Estimate transaction size (p2tr input + inscription output + change output)
+      // Calculate required amount
+      const MIN_FEE_RATE = Math.max(3, feeRate); // Use at least 3 sat/vB
       const estimatedTxSize = 200; // Base size for P2TR transaction
-      const estimatedFee = Math.ceil(estimatedTxSize * effectiveFeeRate);
+      const estimatedFee = Math.ceil(estimatedTxSize * MIN_FEE_RATE);
       const totalRequired = DUST_AMOUNT + estimatedFee;
 
-      console.log('Fee calculation:', {
-        inscriptionSize,
-        currentFeeRate,
-        effectiveFeeRate,
-        estimatedTxSize,
-        estimatedFee,
-        totalRequired
-      });
-
-      // Find suitable UTXO
-      const selectedUtxo = utxos.find(utxo => {
-        const value = utxo.satoshis || utxo.value || 0;
-        return value >= totalRequired;
-      });
-
-      if (!selectedUtxo) {
-        const totalAvailable = utxos.reduce((sum, utxo) => sum + (utxo.satoshis || utxo.value || 0), 0);
-        const largestUtxo = Math.max(...utxos.map(u => u.satoshis || u.value || 0));
-        throw new Error(`No suitable UTXO found. Need ${totalRequired} sats (${estimatedFee} fee), largest UTXO is ${largestUtxo} sats, total available is ${totalAvailable} sats`);
-      }
-
+      // Select best UTXO
+      const selectedUtxo = await selectBestUtxo(totalRequired, MIN_FEE_RATE);
       console.log('Selected UTXO:', selectedUtxo);
 
       // Create the transaction
@@ -197,49 +182,254 @@ function App() {
     }
   };
 
+  const createRevealTransaction = async (commitTxId, inscriptionScript, recipientAddress, feeRate) => {
+    try {
+      // Wait for commit transaction to be confirmed
+      setInscriptionStatus('Waiting for commit transaction confirmation...');
+      
+      // Get the wallet's public key
+      const pubkey = Buffer.from(await window.unisat.getPublicKey(), 'hex').slice(1);
+      
+      // Create taproot tree with inscription
+      const scriptTree = {
+        output: inscriptionScript
+      };
+
+      // Create the tap tree
+      const { output, witness, hash, tapLeaf } = bitcoin.payments.p2tr({
+        internalPubkey: pubkey,
+        scriptTree,
+        network: bitcoin.networks.bitcoin,
+        redeem: {
+          output: inscriptionScript,
+          redeemVersion: 0xc0
+        }
+      });
+
+      // Calculate control block
+      const controlBlock = witness[witness.length - 1];
+      
+      // Create the reveal transaction
+      const psbt = new bitcoin.Psbt({ network: bitcoin.networks.bitcoin });
+
+      // Add the commit output as input
+      psbt.addInput({
+        hash: commitTxId,
+        index: 0, // The inscription output is always at index 0
+        witnessUtxo: {
+          script: output,
+          value: DUST_AMOUNT + 153 // Same value we used in commit tx
+        },
+        tapInternalKey: pubkey,
+        tapLeafScript: [{
+          leafVersion: 0xc0,
+          script: inscriptionScript,
+          controlBlock
+        }]
+      });
+
+      // Add recipient output
+      psbt.addOutput({
+        address: recipientAddress,
+        value: DUST_AMOUNT // The final inscription will have this value
+      });
+
+      // Convert to base64
+      const psbtBase64 = psbt.toBase64();
+      console.log('Reveal PSBT Base64:', psbtBase64.slice(0, 100) + '...');
+      console.log('Debug info:', {
+        pubkey: pubkey.toString('hex'),
+        scriptTree,
+        output: output.toString('hex'),
+        controlBlock: controlBlock.toString('hex'),
+        hash: hash?.toString('hex')
+      });
+
+      return psbtBase64;
+    } catch (error) {
+      console.error('Error creating reveal transaction:', error);
+      throw error;
+    }
+  };
+
+  const waitForTransactionConfirmation = async (txid) => {
+    try {
+      setInscriptionStatus(`Waiting for transaction ${txid.slice(0, 8)}... to be broadcasted`);
+      
+      // Maximum wait time: 30 minutes
+      const maxAttempts = 180;
+      let attempts = 0;
+      let firstSeen = false;
+      
+      while (attempts < maxAttempts) {
+        try {
+          const response = await axios.get(`https://mempool.space/api/tx/${txid}`);
+          
+          if (!firstSeen) {
+            firstSeen = true;
+            setInscriptionStatus(`Transaction ${txid.slice(0, 8)}... found in mempool`);
+          }
+
+          if (response.data.status && response.data.status.confirmed) {
+            console.log(`Transaction ${txid} confirmed!`);
+            return true;
+          }
+
+          // If we get here, transaction exists but not confirmed
+          setInscriptionStatus(`Transaction ${txid.slice(0, 8)}... in mempool, waiting for confirmation...`);
+          
+        } catch (error) {
+          if (error.response && error.response.status === 404) {
+            // Transaction not in mempool yet
+            console.log(`Transaction ${txid} not found in mempool yet, retrying...`);
+            setInscriptionStatus(`Waiting for transaction ${txid.slice(0, 8)}... to appear in mempool...`);
+          } else {
+            console.error(`Error checking transaction status:`, error);
+            setInscriptionStatus(`Error checking status for ${txid.slice(0, 8)}..., retrying...`);
+          }
+        }
+
+        // Wait 10 seconds before next check
+        await new Promise(resolve => setTimeout(resolve, 10000));
+        attempts++;
+      }
+      
+      throw new Error('Transaction confirmation timeout after 30 minutes');
+    } catch (error) {
+      console.error('Error waiting for confirmation:', error);
+      throw error;
+    }
+  };
+
   const inscribeFile = async () => {
     if (!selectedFile || !connected) return;
 
     try {
       setLoading(true);
       setError('');
+      setInscriptionStatus('Creating commit transaction...');
 
       // Get current fee rate
       const feeRate = await getFeeRate();
+      console.log('Current fee rate:', feeRate);
 
       // Read file
       const reader = new FileReader();
       reader.onload = async (e) => {
         try {
           const fileData = new Uint8Array(e.target.result);
+          console.log('File size:', fileData.length, 'bytes');
           
-          // Create and sign transaction
-          const psbtBase64 = await createInscriptionTransaction(fileData, feeRate);
-          console.log('Created PSBT:', psbtBase64);
+          // Create inscription script
+          const inscriptionScript = bitcoin.script.compile([
+            bitcoin.opcodes.OP_1,
+            bitcoin.script.number.encode(32),
+            Buffer.from('ord'),
+            Buffer.from([1]), // version
+            Buffer.from('application/octet-stream'),
+            Buffer.from([0]), // separator
+            Buffer.from(fileData)
+          ]);
 
-          // Sign with wallet
-          const signedPsbtBase64 = await window.unisat.signPsbt(psbtBase64);
-          console.log('Signed PSBT:', signedPsbtBase64);
+          console.log('Inscription script size:', inscriptionScript.length, 'bytes');
 
-          // Broadcast transaction
-          const txid = await window.unisat.pushPsbt(signedPsbtBase64);
-          console.log('Transaction broadcast:', txid);
+          try {
+            // Create commit transaction
+            const commitPsbtBase64 = await createInscriptionTransaction(fileData, feeRate);
+            console.log('Created Commit PSBT:', commitPsbtBase64.slice(0, 100) + '...');
 
-          alert(`Inscription created! Transaction ID: ${txid}\nYou can view it on the blockchain explorer once confirmed.`);
-          setLoading(false);
+            try {
+              // Sign commit transaction
+              console.log('Requesting wallet to sign commit transaction...');
+              const signedCommitPsbtBase64 = await window.unisat.signPsbt(commitPsbtBase64);
+              console.log('Successfully signed commit transaction');
 
+              // Broadcast commit transaction
+              console.log('Broadcasting commit transaction...');
+              const commitTxId = await window.unisat.pushPsbt(signedCommitPsbtBase64);
+              console.log('Commit Transaction broadcast:', commitTxId);
+              
+              setInscriptionStatus('Commit transaction broadcast. Waiting for confirmation...');
+
+              // Wait for commit transaction to confirm
+              try {
+                await waitForTransactionConfirmation(commitTxId);
+              } catch (error) {
+                throw new Error(`Commit transaction failed to confirm: ${error.message}`);
+              }
+
+              setInscriptionStatus('Creating reveal transaction...');
+
+              // Create and sign reveal transaction
+              try {
+                const revealPsbtBase64 = await createRevealTransaction(
+                  commitTxId,
+                  inscriptionScript,
+                  address,
+                  feeRate
+                );
+
+                console.log('Requesting wallet to sign reveal transaction...');
+                const signedRevealPsbtBase64 = await window.unisat.signPsbt(revealPsbtBase64);
+                console.log('Successfully signed reveal transaction');
+
+                // Broadcast reveal transaction
+                console.log('Broadcasting reveal transaction...');
+                const revealTxId = await window.unisat.pushPsbt(signedRevealPsbtBase64);
+                console.log('Reveal Transaction broadcast:', revealTxId);
+                
+                setInscriptionStatus('Waiting for reveal transaction confirmation...');
+                
+                try {
+                  await waitForTransactionConfirmation(revealTxId);
+                  setInscriptionStatus('Inscription complete! ');
+                } catch (error) {
+                  throw new Error(`Reveal transaction failed to confirm: ${error.message}`);
+                }
+
+                alert(
+                  `Inscription complete!\n\n` +
+                  `Commit TX: ${commitTxId}\n` +
+                  `Reveal TX: ${revealTxId}\n\n` +
+                  `View your inscription on the blockchain explorer once confirmed.`
+                );
+              } catch (error) {
+                console.error('Reveal transaction error:', error);
+                throw new Error(`Failed to create or sign reveal transaction: ${error.message}`);
+              }
+            } catch (error) {
+              console.error('Commit transaction signing error:', error);
+              if (error.message.includes('rejected')) {
+                throw new Error('Please accept the transaction in your UniSat wallet to proceed.');
+              } else {
+                throw new Error(`Failed to sign commit transaction: ${error.message}`);
+              }
+            }
+          } catch (error) {
+            console.error('Transaction creation error:', error);
+            throw new Error(`Failed to create transaction: ${error.message}`);
+          }
         } catch (error) {
-          console.error('Inscription error:', error);
-          setError(error.message);
+          console.error('Inscription process error:', error);
+          setError(`Inscription failed: ${error.message}`);
+          setInscriptionStatus('');
+        } finally {
           setLoading(false);
         }
+      };
+
+      reader.onerror = (error) => {
+        console.error('File reading error:', error);
+        setError('Failed to read file');
+        setLoading(false);
       };
 
       reader.readAsArrayBuffer(selectedFile);
 
     } catch (error) {
-      console.error('Error:', error);
+      console.error('Top level error:', error);
       setError(error.message);
+      setInscriptionStatus('');
       setLoading(false);
     }
   };
@@ -285,13 +475,18 @@ function App() {
                     </div>
 
                     {selectedFile && (
-                      <button
-                        onClick={inscribeFile}
-                        disabled={loading}
-                        className="w-full mt-4 px-8 py-3 border border-transparent text-base font-medium rounded-md text-white bg-blue-600 hover:bg-blue-700 disabled:bg-blue-300"
-                      >
-                        {loading ? 'Creating Inscription...' : 'Inscribe File'}
-                      </button>
+                      <>
+                        <button
+                          onClick={inscribeFile}
+                          disabled={loading}
+                          className="w-full mt-4 px-8 py-3 border border-transparent text-base font-medium rounded-md text-white bg-blue-600 hover:bg-blue-700 disabled:bg-blue-300"
+                        >
+                          {loading ? 'Creating Inscription...' : 'Inscribe File'}
+                        </button>
+                        {inscriptionStatus && (
+                          <p className="mt-2 text-sm text-gray-600">{inscriptionStatus}</p>
+                        )}
+                      </>
                     )}
                   </div>
                 )}
